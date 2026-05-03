@@ -1,0 +1,152 @@
+================================================================================
+PROJECT PROPOSAL: SENTIMENT-AWARE CONDITIONAL FACTOR MODEL FOR EQUITY RETURNS
+================================================================================
+
+PROBLEM STATEMENT
+-----------------
+
+Predicting stock returns is one of the most challenging problems in quantitative
+finance. Traditional factor models, such as the Fama-French three-factor model,
+assume that factor risk premia remain constant over time. However, empirical
+evidence suggests that the compensation investors receive for bearing certain
+risks varies substantially across different market regimes. During periods of
+market stress, for example, investors demand higher compensation for holding
+risky assets, while in calm markets, risk premia compress.
+
+This project addresses the fundamental question: How can we build a predictive
+model that captures both the cross-sectional characteristics that make stocks
+differentially exposed to systematic risks AND the time-varying nature of factor
+risk premia driven by market sentiment and volatility regimes?
+
+The key insight is that market sentiment indicators like the CNN Fear & Greed
+Index, combined with volatility measures (VIX, EGARCH), credit spreads, and
+yield curve dynamics, contain valuable information about the current market
+regime. Rather than using sentiment to directly rank stocks (which leads to
+overfitting), sentiment should inform which types of risk exposures are
+rewarded at any given time.
+
+METHODS
+-------
+
+This project implements a Conditional Factor Model architecture with two
+distinct components that enforce a clean separation between stock-specific
+characteristics and market-wide regime information:
+
+1. STOCK EXPOSURE MODEL - b_i,t = f(x_i,t)
+
+   This component learns latent factor exposures from cross-sectional stock
+   characteristics including:
+   - Price momentum (1M, 3M, 6M returns)
+   - Realized volatility (20d, 60d rolling windows)
+   - Rolling beta versus S&P 500 and sector ETFs
+   - Liquidity metrics (average daily volume, turnover)
+   - Size (log market cap)
+   - Fundamental ratios (book-to-market, ROE, debt-to-equity)
+   - Sector/industry embeddings
+
+   The model uses either LightGBM or a shallow MLP to ensure robustness and
+   low variance. Importantly, this component contains NO sentiment data and
+   NO market-wide variables - only stock-specific, slow-moving characteristics.
+
+2. FACTOR PREMIA MODEL - lambda_t = g(m_t)
+
+   This component learns time-varying prices of risk from the market state
+   vector, which includes:
+   - CNN Fear & Greed Index (with trend/momentum features)
+   - VIX level and dynamics
+   - EGARCH conditional volatility and standardized shocks
+   - S&P 500 distance to 200-day MA, momentum, and drawdown
+   - Yield curve spreads (10Y-2Y, 10Y-3M, 30Y-10Y)
+   - High-yield credit spreads (HYG vs TLT)
+   - Real rates (TIP vs TLT)
+   - Market breadth (equal-weight vs cap-weight S&P 500)
+   - Cyclical vs defensive sector rotation
+
+   This component uses a Liquid State Space Model (SSM) architecture that
+   captures temporal dependencies in market regimes while remaining
+   computationally efficient.
+
+The final return prediction is the inner product: r_hat = b_i,t' * lambda_t
+
+Training employs a rolling window walk-forward validation approach with
+1-year training windows, 2-week validation windows, and 2-week test periods
+that slide forward through time. This prevents look-ahead bias and tests
+true out-of-sample predictive performance.
+
+POTENTIAL TECHNOLOGIES
+----------------------
+
+The implementation leverages the following technologies:
+
+- Python 3.10+ as the primary programming language
+- PyTorch for deep learning model implementation (Liquid SSM, MLP components)
+- LightGBM for gradient boosting baseline comparisons
+- yfinance API for historical stock prices and fundamentals
+- CNN Fear & Greed Index API for sentiment data
+- arch library for EGARCH volatility modeling
+- pandas/numpy for data manipulation and feature engineering
+- Apache Parquet for efficient columnar storage of large datasets (~2000 stocks)
+- scikit-learn for preprocessing (StandardScaler) and cross-validation
+
+Hardware requirements include GPU acceleration (CUDA) for training the Liquid
+SSM models, though the architecture is designed to be efficient enough for
+CPU-based inference in production.
+
+POTENTIAL SOCIETAL AND ETHICAL IMPLICATIONS
+-------------------------------------------
+
+1. MARKET FAIRNESS AND ACCESS
+   Sophisticated quantitative models like this one could exacerbate inequality
+   in financial markets if access is limited to well-resourced institutions.
+   The strategies derived from such models may profit at the expense of less
+   sophisticated retail investors who lack access to similar technology. To
+   mitigate this, the project emphasizes transparent methodology that could
+   be replicated by academic researchers.
+
+2. SYSTEMIC RISK CONCERNS
+   If similar sentiment-based factor timing strategies become widely adopted,
+   they could create correlated trading behavior that amplifies market
+   volatility during stress periods. When many algorithms simultaneously
+   detect "extreme fear" and rebalance portfolios, the resulting trades could
+   worsen the very conditions they are responding to. This feedback loop
+   represents a potential source of systemic risk.
+
+3. DATA PRIVACY AND SENTIMENT MANIPULATION
+   The CNN Fear & Greed Index aggregates public market data, but future
+   sentiment indicators might incorporate social media or alternative data
+   sources that raise privacy concerns. Additionally, if market participants
+   know that algorithms respond to specific sentiment signals, there may be
+   incentives to manipulate those signals.
+
+4. ENVIRONMENTAL CONSIDERATIONS
+   Training deep learning models requires computational resources that
+   consume energy. This project mitigates environmental impact by using
+   efficient architectures (Liquid SSM vs Transformers) and optimized data
+   loading pipelines that reduce unnecessary computation.
+
+5. JOB DISPLACEMENT IN FINANCE
+   Automated quantitative strategies may reduce demand for traditional
+   fundamental analysts and portfolio managers. While this represents
+   technological progress, it also displaces workers whose skills may not
+   easily transfer to other roles.
+
+6. MODEL INTERPRETABILITY AND ACCOUNTABILITY
+   Neural network components of the model are less interpretable than
+   traditional linear factor models. When the model makes incorrect
+   predictions leading to losses, it may be difficult to explain why.
+   This "black box" nature raises accountability questions, particularly
+   if the model is used to manage client assets.
+
+CONCLUSION
+----------
+
+This project represents an advancement in factor modeling by incorporating
+sentiment and volatility regime information into a theoretically grounded
+conditional factor framework. By maintaining strict separation between
+stock characteristics and market state, the model avoids common overfitting
+pitfalls while capturing genuine time-variation in risk premia. The approach
+balances predictive power with interpretability by decomposing returns into
+economically meaningful components (exposures and premia), making it suitable
+for both academic research and practical portfolio management applications.
+
+================================================================================

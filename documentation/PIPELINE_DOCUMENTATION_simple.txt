@@ -1,0 +1,393 @@
+================================================================================
+CONDITIONAL FACTOR MODEL - DATA & TRAINING PIPELINE DOCUMENTATION
+================================================================================
+
+Generated: 2025-12-25
+Model: LiquidPremia Conditional Factor Model
+
+================================================================================
+1. DATA STRUCTURE
+================================================================================
+
+RAW DATA FILES
+--------------
+stock_training_data_final/
+├── batch_0.parquet   (~120MB, ~50 tickers)
+├── batch_1.parquet
+├── ...
+└── batch_38.parquet  (39 total files, ~1950 tickers)
+
+market_training_data_final/
+└── market_state_vector.parquet  (201 features, 3410 dates)
+
+
+KEY DIMENSIONS
+--------------
+| Component        | Value | Description                              |
+|------------------|-------|------------------------------------------|
+| SEQ_LEN          | 92    | Days of market history (30 + 63 - 1)     |
+| TARGET_PATCHES   | 30    | Days we predict targets for              |
+| BATCH_SIZE       | 32    | Tickers per training step                |
+| Stock features   | 164   | Per-ticker features (excluding targets)  |
+| Market features  | 201   | Market-wide features                     |
+| Target           | target_ret_1d | 1-day forward return             |
+
+
+TARGET COLUMNS (in data, only target_ret_1d used)
+-------------------------------------------------
+- target_ret_1d   <-- USED FOR TRAINING
+- target_ret_3d   (excluded from features)
+- target_ret_5d   (excluded from features)
+- target_ret_10d  (excluded from features)
+- target_ret_21d  (excluded from features)
+
+
+================================================================================
+2. DATA PIPELINE COMPONENTS
+================================================================================
+
+A. MetadataIndex (Built Once at Startup)
+----------------------------------------
+Purpose: Know which ticker is in which parquet file
+
+ticker_to_meta = {
+    'AAPL': TickerMetadata(batch_idx=0, min_date=..., max_date=..., n_rows=1863),
+    'MSFT': TickerMetadata(batch_idx=0, ...),
+    'GOOGL': TickerMetadata(batch_idx=1, ...),
+    ...
+}
+
+batch_to_tickers = {
+    0: ['AAPL', 'MSFT', 'AMZN', ...],  # ~50 tickers
+    1: ['GOOGL', 'META', ...],
+    ...
+}
+
+
+B. DateWindowSampler
+--------------------
+Purpose: Sample valid date sequences for training
+
+Input:  window_start=2018-10-23, window_end=2019-10-23
+Output: sequence_dates = [2019-03-13, 2019-03-14, ..., 2019-07-23]  # 92 dates
+        available_tickers = ['AAPL', 'MSFT', ...]
+
+Key constraint:
+  - Anchor date (last date) must have SEQ_LEN-1 dates before it
+  - First valid anchor = stock_data_start + SEQ_LEN
+
+
+C. ParquetFilteredReader
+------------------------
+Purpose: Read ONLY the rows needed from parquet files
+
+extract_ticker_data(tickers=['AAPL', 'MSFT'], dates=[92 dates], ...)
+
+1. Group tickers by batch_idx:
+   batch_0 -> ['AAPL', 'MSFT']
+   batch_1 -> ['GOOGL']
+
+2. For each batch, read with PREDICATE PUSHDOWN:
+   pd.read_parquet(
+       'batch_0.parquet',
+       columns=['date', 'ticker', ...features..., 'target_ret_1d'],
+       filters=[
+           ('ticker', 'in', ['AAPL', 'MSFT']),
+           ('date', '>=', min_date),
+           ('date', '<=', max_date + 1 day)  # +1 for timezone offset
+       ]
+   )
+
+3. Return: {'AAPL': DataFrame(92 rows), 'MSFT': DataFrame(92 rows), ...}
+
+
+D. ConditionalFactorDatasetV2
+-----------------------------
+Purpose: Prepare tensors for model with masking
+
+Input:
+  - tickers: ['AAPL', 'MSFT', ...]  (32 tickers)
+  - market_sequence: (92, 201)       # Same for all tickers
+  - ticker_data: {'AAPL': DataFrame, ...}
+  - sequence_dates: [92 dates]
+
+For each ticker, __getitem__ returns:
+  - market_seq: (92, 201)           # Shared, already standardized
+  - stock_feat: (164,)              # Features at anchor date (raw)
+  - targets: (30,)                  # Last 30 days of target_ret_1d
+  - mask: (30,)                     # 1.0 where data exists, 0.0 where missing
+
+collate_masked_batch() then:
+  - Stacks into batches: (B, 92, 201), (B, 164), (B, 30), (B, 30)
+  - Standardizes stock features PER-BATCH (zero mean, unit var)
+
+
+================================================================================
+3. TRAINING PIPELINE
+================================================================================
+
+OVERALL STRUCTURE: 2-Phase Rolling Windows
+------------------------------------------
+
+|<------- 1 year training ------->|<- 14d val ->|<- 14d test ->|
+|           PHASE A               |   PHASE B   |    TEST      |
+|  Train on this, validate here   | Finetune    |  Evaluate    |
+
+Window 1: 2018-10-23 to 2019-10-23 | 2019-10-23 to 2019-11-06 | 2019-11-06 to 2019-11-20
+Window 2: 2018-11-06 to 2019-11-06 | 2019-11-06 to 2019-11-20 | 2019-11-20 to 2019-12-04
+... (slides by 14 days each window)
+
+
+PHASE A: Main Training (within one window)
+------------------------------------------
+
+for epoch in range(50):  # EPOCHS_PER_WINDOW
+
+    # 1. RESET LR (each epoch is fresh)
+    optimizer.lr = 0.001
+
+    # 2. SAMPLE FIXED DATES FOR THIS EPOCH
+    sequence_dates = sampler.sample_epoch_dates(train_start, train_end)
+    # e.g., [2019-03-13, ..., 2019-07-23]  # 92 dates
+
+    print(f"Epoch {epoch} dates: 2019-03-13 to 2019-07-23")
+
+    # 3. LOAD MARKET DATA ONCE
+    market_seq = market_df.loc[sequence_dates].values  # (92, 201)
+
+    # 4. SELECT ACTIVE PARQUETS
+    active_parquets = random.choice(39, size=4)  # e.g., [3, 12, 28, 35]
+    ticker_pool = tickers_in_those_parquets  # ~200 tickers
+
+    print(f"Parquets: [3, 12, 28, 35] (200 tickers)")
+
+    for step in range(100):  # STEPS_PER_EPOCH
+
+        # 5. ROTATE PARQUETS EVERY 10 STEPS
+        if step % 10 == 0 and step > 0:
+            active_parquets = random.choice(39, size=4)
+            ticker_pool = tickers_in_those_parquets
+            print(f"Step {step}: Rotated to parquets {active_parquets}")
+
+        # 6. SAMPLE TICKERS FROM POOL
+        batch_tickers = random.choice(ticker_pool, size=32)
+
+        # 7. READ STOCK DATA (only 4 parquets, not 21)
+        ticker_data = parquet_reader.extract_ticker_data(
+            tickers=batch_tickers,
+            dates=sequence_dates,
+            feature_cols=stock_feature_cols,
+            target_col='target_ret_1d'
+        )
+
+        # 8. CREATE DATASET & BATCH
+        dataset = ConditionalFactorDatasetV2(...)
+        market_batch, stock_batch, targets, mask = collate_masked_batch(...)
+        # market_batch: (32, 92, 201)
+        # stock_batch:  (32, 164)
+        # targets:      (32, 30)
+        # mask:         (32, 30)
+
+        # 9. FORWARD PASS
+        y_pred = model(market_batch, stock_batch)  # (32, 30)
+
+        # 10. MASKED LOSS (only count where mask=1)
+        loss = masked_weighted_loss(y_pred, targets, mask, weights)
+
+        # 11. BACKWARD + OPTIMIZE
+        loss.backward()
+        optimizer.step()
+
+        # 12. PRINT EVERY show_rate STEPS
+        if step % show_rate == 0:
+            print(f"Step {step} - Loss: {loss}, Corr: {corr}, Dir: {dir_acc}")
+
+    # 13. VALIDATION AT END OF EPOCH
+    val_loss, val_preds, val_targets = evaluate(val_start, val_end)
+    print(f"Epoch {epoch} VAL - Loss: {val_loss}, Corr: {corr}")
+
+    # 14. EARLY STOPPING CHECK
+    if val_loss < best_val_loss:
+        best_model_state = model.state_dict()
+    else:
+        patience_counter += 1
+        if patience_counter >= 20:
+            break
+
+
+PHASE B: Fine-tuning (on validation data)
+-----------------------------------------
+
+# Load best model from Phase A
+model.load_state_dict(best_model_state)
+
+# Fresh optimizer with lower LR
+optimizer = AdamW(lr=0.0005)
+
+for epoch in range(5):  # PHASE_B_EPOCHS
+    # Same loop structure as Phase A
+    # But uses val_start to val_end as training data
+    ...
+
+
+TEST: Final Evaluation
+----------------------
+
+# Model now has Phase B weights
+test_loss, test_preds, test_targets = evaluate(test_start, test_end)
+# This is TRUE out-of-sample (never seen during training or fine-tuning)
+
+
+================================================================================
+4. KEY OPTIMIZATIONS
+================================================================================
+
+| Optimization             | What It Does                              | Speedup   |
+|--------------------------|-------------------------------------------|-----------|
+| Parquet Rotation         | Only read from 4 parquets instead of 21   | ~10x      |
+| Fixed Dates per Epoch    | Load market data once per epoch           | Memory    |
+| Predicate Pushdown       | Read only matching rows from parquet      | ~50x      |
+| Column Pruning           | Only read needed columns                  | ~2x       |
+| OS Page Cache            | Same 4 files cached in RAM for 10 steps   | ~2.5x     |
+| Per-Batch Standardization| No pre-fitted scalers needed              | No leakage|
+
+
+TIMING COMPARISON
+-----------------
+| Approach                    | Time per Step | Notes                    |
+|-----------------------------|---------------|--------------------------|
+| OLD (21 files/step)         | ~4,300ms      | Random tickers hit many  |
+| NEW (4 files/step)          | ~435ms        | Limited parquet set      |
+| NEW + OS Cache (steps 2-10) | ~370ms        | Files cached in RAM      |
+
+
+================================================================================
+5. DATA FLOW DIAGRAM
+================================================================================
+
+                           EPOCH START
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │   DateWindowSampler.sample_epoch_dates()   │
+            │   → sequence_dates (92 dates)              │
+            └─────────────────────────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │   market_df.loc[sequence_dates]           │
+            │   → market_seq (92, 201)                  │
+            └─────────────────────────────────────┘
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │   Select 4 active parquets                │
+            │   → ticker_pool (~200 tickers)            │
+            └─────────────────────────────────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │         STEP LOOP (100x)        │
+              │                                  │
+              │  ┌───────────────────────────┐  │
+              │  │ Sample 32 tickers         │  │
+              │  └───────────────────────────┘  │
+              │               │                  │
+              │               ▼                  │
+              │  ┌───────────────────────────┐  │
+              │  │ ParquetFilteredReader     │  │
+              │  │ → ticker_data (32 DFs)    │  │
+              │  └───────────────────────────┘  │
+              │               │                  │
+              │               ▼                  │
+              │  ┌───────────────────────────┐  │
+              │  │ ConditionalFactorDatasetV2│  │
+              │  │ + collate_masked_batch    │  │
+              │  │ → (B,92,201), (B,164),    │  │
+              │  │    (B,30), (B,30)         │  │
+              │  └───────────────────────────┘  │
+              │               │                  │
+              │               ▼                  │
+              │  ┌───────────────────────────┐  │
+              │  │ Model Forward Pass        │  │
+              │  │ → y_pred (B, 30)          │  │
+              │  └───────────────────────────┘  │
+              │               │                  │
+              │               ▼                  │
+              │  ┌───────────────────────────┐  │
+              │  │ masked_weighted_loss      │  │
+              │  │ → loss scalar             │  │
+              │  └───────────────────────────┘  │
+              │               │                  │
+              │               ▼                  │
+              │  ┌───────────────────────────┐  │
+              │  │ Backward + Optimizer Step │  │
+              │  └───────────────────────────┘  │
+              │                                  │
+              │  (Rotate parquets every 10 steps)│
+              └────────────────┬────────────────┘
+                               │
+                               ▼
+                         EPOCH END
+                               │
+                               ▼
+            ┌─────────────────────────────────────┐
+            │   Validation Evaluation                   │
+            │   → val_loss, val_corr, val_dir_acc       │
+            └─────────────────────────────────────┘
+
+
+================================================================================
+6. MODEL ARCHITECTURE SUMMARY
+================================================================================
+
+The model follows the conditional factor model framework:
+
+    r̂_{i,t+H} = b_{i,t}^T × λ_t
+
+Where:
+  - b_{i,t} = f(x_{i,t})  : Stock exposures from stock features
+  - λ_t = g(m_t)          : Factor premia from market state
+
+Components:
+  - StockExposureModel: MLP that processes (B, 164) → (B, N_FACTORS)
+  - FactorPremiaHead: Processes market sequence → time-varying premia
+  - LiquidPremia: Combines both to predict returns
+
+
+================================================================================
+7. CONFIGURATION REFERENCE
+================================================================================
+
+# Model
+N_FACTORS = 8
+D_MODEL = 32
+N_LIQUID_LAYERS = 1
+D_STATE = 16
+
+# Training - Phase A
+LEARNING_RATE = 0.001
+BATCH_SIZE = 32
+STEPS_PER_EPOCH = 100
+EPOCHS_PER_WINDOW = 50
+PATIENCE = 20
+
+# Training - Phase B
+PHASE_B_EPOCHS = 5
+PHASE_B_LR = 0.0005
+PHASE_B_STEPS_PER_EPOCH = 50
+
+# Walk-forward
+TRAIN_YEARS = 1.0
+VAL_YEARS = 2/52  # 14 days
+
+# Parquet Optimization
+N_ACTIVE_PARQUETS = 4
+STEPS_PER_ROTATION = 10
+
+# Display
+SHOW_RATE = 1  # Print metrics every N steps
+
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

@@ -1,0 +1,1417 @@
+================================================================================
+CONDITIONAL FACTOR MODEL - COMPREHENSIVE PIPELINE DOCUMENTATION
+================================================================================
+
+Generated: 2025-01-31
+Model: LiquidPremia Conditional Factor Model
+Notebook: conditional_factor_model.ipynb
+
+This document provides detailed function-level documentation of the entire
+training pipeline, including exact signatures, data flows, and known issues.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. DATA STRUCTURE
+2. METADATAINDEX CLASS
+3. DATEWINDOWSAMPLER CLASS
+4. PARQUETFILTEREDREADER CLASS
+5. CONDITIONALFACTORDATASETV2 CLASS
+6. COLLATE_MASKED_BATCH FUNCTION
+7. ROLLINGWINDOWTRAINER CLASS
+8. LOSS FUNCTIONS
+9. MODEL ARCHITECTURE
+10. TRAINING PIPELINE FLOW
+11. KNOWN ISSUE: TICKER DATE COVERAGE
+12. CONFIGURATION REFERENCE
+
+
+================================================================================
+1. DATA STRUCTURE
+================================================================================
+
+RAW DATA FILES
+--------------
+stock_training_data_final/
+    batch_0000.parquet   (~120MB, 50 tickers)
+    batch_0001.parquet
+    ...
+    batch_0058.parquet   (59 total files, ~2950 tickers)
+                         NOTE: batch_0058 has only 8 tickers (recent IPOs)
+
+market_training_data_final/
+    market_state_vector.parquet  (201 features, ~3410 dates)
+
+
+KEY DIMENSIONS
+--------------
+| Component        | Value | Description                              |
+|------------------|-------|------------------------------------------|
+| SEQ_LEN          | 92    | Days of market history for factor premia |
+| TARGET_PATCHES   | 30    | Days we predict targets for              |
+| BATCH_SIZE       | 64    | Tickers per training step                |
+| Stock features   | 164   | Per-ticker features (excluding targets)  |
+| Market features  | 201   | Market-wide features                     |
+| N_FACTORS        | 16    | Latent factor dimension                  |
+| D_MODEL          | 32    | Hidden dimension in Liquid encoder       |
+
+
+PARQUET FILE ORGANIZATION
+-------------------------
+Parquet files are organized chronologically by when stocks started trading:
+- batch_0000 - batch_0040: Older stocks (data from 2015+)
+- batch_0041 - batch_0050: Stocks that IPO'd around 2020-2021
+- batch_0051 - batch_0058: Recent IPOs (2021-2025)
+
+IMPORTANT: This means when training on early dates (e.g., 2019), stocks in
+later batches (50+) will have NO VALID DATA for those dates.
+
+
+================================================================================
+2. METADATAINDEX CLASS
+================================================================================
+
+PURPOSE: Pre-scan all parquet files to build an index mapping tickers to their
+         locations and date ranges. Enables O(1) lookups without reading data.
+
+LOCATION: Cell 19 of conditional_factor_model.ipynb
+
+
+TICKERMETADATA DATACLASS
+------------------------
+@dataclass
+class TickerMetadata:
+    ticker: str              # Ticker symbol (e.g., 'AAPL')
+    batch_idx: int           # Which batch file contains this ticker (0-58)
+    min_date: pd.Timestamp   # First available date in dataset
+    max_date: pd.Timestamp   # Last available date in dataset
+    n_rows: int              # Total rows in parquet for this ticker
+    date_set: frozenset      # frozenset of all available dates (for gap detection)
+
+
+CONSTRUCTOR
+-----------
+def __init__(
+    self,
+    stock_data_dir: str,           # Path to stock_training_data_final/
+    batch_files: List[str],        # Sorted list of parquet filenames
+    cache_path: Optional[str]      # Optional pickle file for caching
+)
+
+Behavior:
+1. If cache_path exists: loads pickled index (fast, ~1 second)
+2. Otherwise: calls _build_index() (slow, ~5 minutes for 59 files)
+
+
+METHOD: _build_index()
+----------------------
+def _build_index(self) -> None
+
+Scans all parquet files and populates:
+- self.ticker_to_meta: Dict[str, TickerMetadata]
+- self.batch_to_tickers: Dict[int, Set[str]]
+- self.all_dates: List[pd.Timestamp]
+- self.date_to_idx: Dict[pd.Timestamp, int]
+
+Algorithm:
+    all_dates_set = set()
+
+    for batch_idx, batch_file in enumerate(batch_files):
+        # Only read date and ticker columns (minimal I/O)
+        df = pd.read_parquet(batch_path, columns=['date', 'ticker'])
+
+        for ticker in df['ticker'].unique():
+            ticker_df = df[df['ticker'] == ticker]
+            dates = ticker_df['date'].values
+
+            # Normalize dates (remove timezone, set to midnight)
+            date_timestamps = [pd.Timestamp(d).normalize() for d in dates]
+
+            # Create metadata
+            self.ticker_to_meta[ticker] = TickerMetadata(
+                ticker=ticker,
+                batch_idx=batch_idx,
+                min_date=min(date_timestamps),
+                max_date=max(date_timestamps),
+                n_rows=len(dates),
+                date_set=frozenset(date_timestamps)
+            )
+
+            self.batch_to_tickers[batch_idx].add(ticker)
+            all_dates_set.update(date_timestamps)
+
+        del df
+        gc.collect()  # Free memory after each batch
+
+    self.all_dates = sorted(all_dates_set)
+    self.date_to_idx = {d: i for i, d in enumerate(self.all_dates)}
+
+
+METHOD: _save_to_cache() / _load_from_cache()
+---------------------------------------------
+def _save_to_cache(self, cache_path: str) -> None
+def _load_from_cache(self, cache_path: str) -> None
+
+Pickles/unpickles the entire index to avoid re-scanning.
+Cache file: 'metadata_index.pkl' (typically ~50MB)
+
+
+METHOD: get_tickers_for_date_range()
+------------------------------------
+def get_tickers_for_date_range(
+    self,
+    start_date: pd.Timestamp,      # Window start
+    end_date: pd.Timestamp,        # Window end (anchor date)
+    require_anchor: bool = True    # If True, ticker must have data AT end_date
+) -> List[str]
+
+Returns list of tickers that have data covering [start_date, end_date].
+If require_anchor=True, ticker must also have data exactly at end_date.
+
+Used by DateWindowSampler to find valid tickers for a training window.
+
+
+================================================================================
+3. DATEWINDOWSAMPLER CLASS
+================================================================================
+
+PURPOSE: Sample valid date sequences and tickers for training windows.
+         Handles the constraint that we need SEQ_LEN consecutive dates.
+
+LOCATION: Cell 20 of conditional_factor_model.ipynb
+
+
+CONSTRUCTOR
+-----------
+def __init__(
+    self,
+    index: MetadataIndex,                    # The metadata index
+    market_dates: List[pd.Timestamp],        # Dates available in market data
+    seq_len: int = 92,                       # Sequence length (default 92)
+    target_patches: int = 30                 # Number of target predictions
+)
+
+Computes:
+- self.common_dates: Intersection of stock dates and market dates (sorted)
+- self.date_to_idx: Dict mapping date -> index in common_dates
+
+
+METHOD: sample_epoch_dates()
+----------------------------
+def sample_epoch_dates(
+    self,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    rng: np.random.Generator
+) -> Tuple[List[pd.Timestamp], List[str]]
+
+PURPOSE: Pick ONE random date sequence for an entire epoch.
+         All training steps in that epoch use the SAME dates.
+         This is a key I/O optimization - market data loaded once per epoch.
+
+Algorithm:
+1. Find valid anchor dates:
+   - anchor_date must be in [window_start + seq_len - 1, window_end]
+   - anchor_date must have seq_len-1 dates before it in common_dates
+
+2. Randomly sample one anchor_date from valid dates
+
+3. Build sequence:
+   anchor_idx = date_to_idx[anchor_date]
+   sequence_dates = common_dates[anchor_idx - seq_len + 1 : anchor_idx + 1]
+   # This gives exactly seq_len consecutive dates
+
+4. Find all tickers with data for this sequence:
+   available_tickers = index.get_tickers_for_date_range(
+       sequence_dates[0], sequence_dates[-1]
+   )
+
+Returns: (sequence_dates, available_tickers)
+
+
+METHOD: get_last_date_sequence()
+--------------------------------
+def get_last_date_sequence(
+    self,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp
+) -> Tuple[List[pd.Timestamp], List[str]]
+
+Same as sample_epoch_dates() but uses the LAST valid anchor date instead
+of a random one. Used for deterministic validation/test evaluation.
+
+
+METHOD: sample_training_step() [Alternative]
+--------------------------------------------
+def sample_training_step(
+    self,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    n_tickers: int = 50,
+    rng: np.random.Generator = None
+) -> Tuple[List[pd.Timestamp], List[str]]
+
+Alternative method that samples both dates AND tickers for a single step.
+NOT used in current training (we use sample_epoch_dates + ticker sampling).
+
+
+================================================================================
+4. PARQUETFILTEREDREADER CLASS
+================================================================================
+
+PURPOSE: Read data from parquet files using predicate pushdown for efficiency.
+         Only reads the exact rows and columns needed.
+
+LOCATION: Cell 21 of conditional_factor_model.ipynb
+
+
+CONSTRUCTOR
+-----------
+def __init__(
+    self,
+    stock_data_dir: str,                        # Path to stock_training_data_final/
+    batch_files: List[str],                     # Sorted list of parquet filenames
+    index: MetadataIndex,                       # The metadata index
+    static_features_df: Optional[pd.DataFrame]  # Optional static features (sector, etc.)
+)
+
+
+METHOD: extract_ticker_data() [CRITICAL]
+----------------------------------------
+def extract_ticker_data(
+    self,
+    tickers: List[str],                         # Tickers to extract
+    dates: List[pd.Timestamp],                  # Dates to extract
+    feature_cols: List[str],                    # Feature columns to read
+    target_col: str                             # Target column (e.g., 'target_ret_1d')
+) -> Dict[str, pd.DataFrame]
+
+Returns: Dict mapping ticker -> DataFrame indexed by date
+
+DETAILED ALGORITHM:
+
+1. GROUP TICKERS BY BATCH
+   ----------------------
+   batch_to_tickers = defaultdict(list)
+   for ticker in tickers:
+       if ticker in self.index.ticker_to_meta:
+           batch_idx = self.index.ticker_to_meta[ticker].batch_idx
+           batch_to_tickers[batch_idx].append(ticker)
+
+   Example:
+   Input tickers: ['AAPL', 'MSFT', 'GOOGL', 'META']
+   Result: {0: ['AAPL', 'MSFT'], 1: ['GOOGL', 'META']}
+
+2. PREPARE DATE FILTERS
+   --------------------
+   date_list = [pd.Timestamp(d) for d in dates]
+   min_date = min(date_list)
+   max_date = max(date_list)
+
+   # CRITICAL: Convert to UTC for parquet filter
+   # Parquet stores dates as datetime64[ns, UTC]
+   if min_date.tz is None:
+       min_date_filter = min_date.tz_localize('UTC')
+       # Add 1 day because parquet stores dates with 04:00 UTC offset
+       # e.g., 2019-07-23 is stored as 2019-07-23 04:00:00 UTC
+       # So filter <= 2019-07-23 00:00:00 UTC would miss it
+       max_date_filter = (max_date + pd.Timedelta(days=1)).tz_localize('UTC')
+
+3. READ EACH BATCH WITH PREDICATE PUSHDOWN
+   ---------------------------------------
+   for batch_idx, batch_tickers in batch_to_tickers.items():
+       batch_path = os.path.join(stock_data_dir, batch_files[batch_idx])
+
+       # Determine columns to read (excludes static features)
+       dynamic_cols = [c for c in feature_cols if c not in static_feature_cols]
+       columns_to_read = ['date', 'ticker'] + dynamic_cols + [target_col]
+
+       # Build predicate pushdown filters
+       filters = [
+           ('ticker', 'in', batch_tickers),
+           ('date', '>=', min_date_filter),
+           ('date', '<=', max_date_filter)
+       ]
+
+       # This is where the magic happens - parquet only reads matching rows
+       df = pd.read_parquet(
+           batch_path,
+           columns=columns_to_read,
+           filters=filters
+       )
+
+       # Normalize dates back to tz-naive midnight
+       df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.normalize()
+
+4. SPLIT BY TICKER AND MERGE STATIC FEATURES
+   -----------------------------------------
+   for ticker in batch_tickers:
+       ticker_df = df[df['ticker'] == ticker].copy()
+       ticker_df = ticker_df.set_index('date').sort_index()
+
+       # Merge static features if available
+       if static_features_df is not None and ticker in static_features_df.index:
+           for col in static_feature_cols:
+               ticker_df[col] = static_features_df.loc[ticker, col]
+
+       result[ticker] = ticker_df
+
+5. RETURN DICT OF DATAFRAMES
+   -------------------------
+   return result  # {'AAPL': DataFrame(30 rows), 'MSFT': DataFrame(30 rows), ...}
+
+
+I/O OPTIMIZATION: ONLY TARGET_PATCHES DATES
+-------------------------------------------
+In training, we only read the LAST TARGET_PATCHES (30) dates from parquet,
+not the full SEQ_LEN (92) dates. This is because:
+
+- Stock features: Only need anchor date (last date) - ONE row
+- Targets: Only need last TARGET_PATCHES dates - 30 rows
+- Market data: Needs full SEQ_LEN, but loaded from market_df (already in memory)
+
+This reduces parquet I/O by ~67% (30 rows vs 92 rows per ticker).
+
+
+================================================================================
+5. CONDITIONALFACTORDATASETV2 CLASS
+================================================================================
+
+PURPOSE: PyTorch Dataset that prepares tensors with masking for missing data.
+         Handles per-batch standardization and the shared market sequence.
+
+LOCATION: Cell 22 of conditional_factor_model.ipynb
+
+
+CONSTRUCTOR
+-----------
+def __init__(
+    self,
+    tickers: List[str],                         # Batch of tickers to process
+    market_sequence: np.ndarray,                # (seq_len, F_market) - SHARED
+    ticker_data: Dict[str, pd.DataFrame],       # Output from extract_ticker_data()
+    sequence_dates: List[pd.Timestamp],         # Dates in the sequence
+    feature_cols: List[str],                    # Stock feature column names
+    target_col: str,                            # Target column name
+    target_patches: int = 30                    # Number of predictions
+)
+
+Key insight: market_sequence is the SAME for all tickers in the batch.
+Only stock features and targets vary per ticker.
+
+
+METHOD: _prepare_market_features()
+----------------------------------
+def _prepare_market_features(self) -> None
+
+Per-batch standardization of market features:
+    market = self.market_sequence.copy()
+    market = np.nan_to_num(market, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Zero mean, unit variance PER-BATCH
+    mean = market.mean(axis=0, keepdims=True)
+    std = market.std(axis=0, keepdims=True) + 1e-8
+    market = (market - mean) / std
+
+    self.market_tensor = torch.FloatTensor(market)
+
+
+METHOD: __len__()
+-----------------
+def __len__(self) -> int:
+    return len(self.tickers)
+
+
+METHOD: __getitem__()
+---------------------
+def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+
+Returns 4-tuple:
+    (market_seq, stock_feat, targets, mask)
+
+    market_seq: torch.FloatTensor, shape (seq_len, F_market)
+                Already standardized, SAME for all samples
+
+    stock_feat: torch.FloatTensor, shape (F_stock,)
+                RAW stock features at anchor date (NOT standardized yet)
+
+    targets:    torch.FloatTensor, shape (target_patches,)
+                Target returns for last target_patches dates, scaled by 100
+
+    mask:       torch.FloatTensor, shape (target_patches,)
+                1.0 where data exists, 0.0 where missing
+
+DETAILED ALGORITHM:
+
+    ticker = self.tickers[idx]
+    ticker_df = self.ticker_data.get(ticker, pd.DataFrame())
+
+    # Anchor date is the LAST date in the sequence
+    anchor_date = self.sequence_dates[-1]
+
+    # STOCK FEATURES at anchor date
+    if len(ticker_df) > 0 and anchor_date in ticker_df.index:
+        available_cols = [c for c in self.feature_cols if c in ticker_df.columns]
+        stock_row = ticker_df.loc[anchor_date, available_cols].values.astype(np.float32)
+
+        # Pad if some columns are missing
+        if len(available_cols) < len(self.feature_cols):
+            full_row = np.zeros(len(self.feature_cols), dtype=np.float32)
+            col_indices = [self.feature_cols.index(c) for c in available_cols]
+            full_row[col_indices] = stock_row
+            stock_row = full_row
+    else:
+        stock_row = np.zeros(len(self.feature_cols), dtype=np.float32)
+
+    stock_row = np.nan_to_num(stock_row, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # TARGETS and MASK for last target_patches dates
+    target_dates = self.sequence_dates[-self.target_patches:]
+    targets = np.zeros(self.target_patches, dtype=np.float32)
+    mask = np.zeros(self.target_patches, dtype=np.float32)
+
+    for i, date in enumerate(target_dates):
+        if len(ticker_df) > 0 and date in ticker_df.index:
+            val = ticker_df.loc[date, self.target_col]
+            if not np.isnan(val):
+                targets[i] = val * 100  # Scale to basis points
+                mask[i] = 1.0
+
+    return (
+        self.market_tensor,              # (seq_len, F_market)
+        torch.FloatTensor(stock_row),    # (F_stock,)
+        torch.FloatTensor(targets),      # (target_patches,)
+        torch.FloatTensor(mask)          # (target_patches,)
+    )
+
+
+================================================================================
+6. COLLATE_MASKED_BATCH FUNCTION
+================================================================================
+
+PURPOSE: Custom collate function that stacks samples and performs per-batch
+         standardization of stock features.
+
+LOCATION: Cell 22 of conditional_factor_model.ipynb
+
+
+SIGNATURE
+---------
+def collate_masked_batch(
+    batch: List[Tuple[Tensor, Tensor, Tensor, Tensor]]
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+
+Input:  List of (market_seq, stock_feat, targets, mask) tuples from __getitem__
+Output: Batched tensors ready for model forward pass
+
+
+ALGORITHM
+---------
+    market_seqs, stock_feats, targets, masks = zip(*batch)
+
+    # MARKET SEQUENCE
+    # Since market_seq is the same for all samples, take first and expand
+    # Shape: (seq_len, F_market) -> (B, seq_len, F_market)
+    market_seq = market_seqs[0].unsqueeze(0).expand(len(batch), -1, -1)
+
+    # STOCK FEATURES - Stack and standardize per-batch
+    # This is where stock features get standardized (not in __getitem__)
+    stock_batch = torch.stack(stock_feats)  # (B, F_stock)
+
+    # Per-batch standardization
+    mean = stock_batch.mean(dim=0, keepdim=True)
+    std = stock_batch.std(dim=0, keepdim=True) + 1e-8
+    stock_batch = (stock_batch - mean) / std
+
+    # TARGETS and MASKS - Just stack
+    return (
+        market_seq,                # (B, seq_len, F_market)
+        stock_batch,               # (B, F_stock) - NOW standardized
+        torch.stack(targets),      # (B, target_patches)
+        torch.stack(masks)         # (B, target_patches)
+    )
+
+
+WHY PER-BATCH STANDARDIZATION?
+------------------------------
+1. No data leakage: No pre-fitted scaler that could leak future information
+2. Robust to distribution shift: Each batch normalized independently
+3. Simpler pipeline: No need to save/load scalers
+4. Cross-sectional normalization: Stock features become relative rankings
+
+
+================================================================================
+7. ROLLINGWINDOWTRAINER CLASS
+================================================================================
+
+PURPOSE: Orchestrates the entire training process including:
+         - Rolling window walk-forward validation
+         - 2-phase training (Phase A + Phase B)
+         - Parquet rotation optimization
+         - Evaluation and checkpointing
+
+LOCATION: Cell 25 of conditional_factor_model.ipynb
+
+
+CONSTRUCTOR
+-----------
+def __init__(
+    self,
+    model: nn.Module,                           # The LiquidPremia model
+    index: MetadataIndex,                       # Metadata index
+    sampler: DateWindowSampler,                 # Date/ticker sampler
+    parquet_reader: ParquetFilteredReader,      # Parquet reader
+    market_df: pd.DataFrame,                    # Market state vector (full data)
+    feature_cols: List[str],                    # Stock feature column names
+    target_col: str,                            # Target column name
+    config: dict,                               # Training configuration
+    device: torch.device                        # 'cpu' or 'cuda'
+)
+
+
+CONFIG DICTIONARY
+-----------------
+config = {
+    'seq_len': int,                 # Sequence length (e.g., 92)
+    'target_patches': int,          # Number of targets (e.g., 30)
+    'batch_size': int,              # Tickers per batch (e.g., 64)
+    'steps_per_epoch': int,         # Training steps per epoch (e.g., 200)
+    'epochs_per_window': int,       # Max epochs per window (e.g., 100)
+    'val_steps': int,               # Validation steps (e.g., 50)
+    'learning_rate': float,         # Initial LR (e.g., 0.001)
+    'patience': int,                # Early stopping patience (e.g., 20)
+    'decay': float,                 # Exponential weight decay (e.g., 0.75)
+    'n_active_parquets': int,       # Parquets in rotation (e.g., 4)
+    'steps_per_rotation': int,      # Steps before rotating (e.g., 20)
+    'show_rate': int                # Print metrics every N steps (e.g., 20)
+}
+
+
+INTERNAL ATTRIBUTES
+-------------------
+self._n_batches = len(batch_files)              # Total parquet files (59)
+self._batch_to_tickers = index.batch_to_tickers # batch_idx -> Set[ticker]
+self.weights = create_exponential_weights(      # Pre-computed loss weights
+    config['target_patches'],
+    decay=config['decay']
+).to(device)
+
+
+METHOD: _select_active_parquets() [FIXED]
+-----------------------------------------
+def _select_active_parquets(
+    self,
+    n_active: int,
+    rng: np.random.Generator,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp
+) -> Tuple[List[int], List[str]]
+
+PURPOSE: Select N random parquet files and return tickers valid for the date range.
+         This is the parquet rotation optimization.
+
+IMPLEMENTATION:
+    active_batches = rng.choice(
+        self._n_batches,
+        size=min(n_active, self._n_batches),
+        replace=False
+    ).tolist()
+
+    ticker_pool = []
+    for batch_idx in active_batches:
+        for ticker in self._batch_to_tickers[batch_idx]:
+            meta = self.index.ticker_to_meta[ticker]
+            # Only include tickers with data covering the full date range
+            if meta.min_date <= date_start and meta.max_date >= date_end:
+                ticker_pool.append(ticker)
+
+    return active_batches, ticker_pool
+
+The function now filters tickers by date coverage using MetadataIndex information.
+Only tickers whose data spans [date_start, date_end] are included in the pool.
+
+All call sites pass sequence_dates[0] and sequence_dates[-1] as the date range.
+
+
+METHOD: _sample_tickers_from_pool()
+-----------------------------------
+def _sample_tickers_from_pool(
+    self,
+    ticker_pool: List[str],
+    batch_size: int,
+    rng: np.random.Generator
+) -> List[str]
+
+Simple random sampling without replacement:
+    n_sample = min(batch_size, len(ticker_pool))
+    return rng.choice(ticker_pool, size=n_sample, replace=False).tolist()
+
+
+METHOD: _train_step_fixed_dates()
+---------------------------------
+def _train_step_fixed_dates(
+    self,
+    sequence_dates: List[pd.Timestamp],  # Pre-sampled (fixed per epoch)
+    market_seq: np.ndarray,              # Pre-extracted market data
+    tickers: List[str],                  # Batch of tickers
+    optimizer: torch.optim.Optimizer
+) -> Tuple[float, int, np.ndarray, np.ndarray, np.ndarray]
+
+Returns: (loss, n_valid, predictions, targets, masks)
+
+FULL ALGORITHM:
+
+    self.model.train()
+
+    # OPTIMIZATION: Only read last TARGET_PATCHES dates from parquet
+    # Stock features only need anchor date, targets only need last 30 dates
+    # Full SEQ_LEN (92) is only for market data (already in memory)
+    stock_dates = sequence_dates[-self.config['target_patches']:]
+
+    # Read stock data from parquet
+    ticker_data = self.parquet_reader.extract_ticker_data(
+        tickers=tickers,
+        dates=stock_dates,              # Only 30 dates, not 92
+        feature_cols=self.feature_cols,
+        target_col=self.target_col
+    )
+
+    # Create dataset
+    dataset = ConditionalFactorDatasetV2(
+        tickers=tickers,
+        market_sequence=market_seq,     # Full 92 dates for factor premia
+        ticker_data=ticker_data,
+        sequence_dates=stock_dates,     # Only 30 dates for stock data
+        feature_cols=self.feature_cols,
+        target_col=self.target_col,
+        target_patches=self.config['target_patches']
+    )
+
+    # Build batch
+    batch = [dataset[i] for i in range(len(dataset))]
+    market_batch, stock_batch, targets, mask = collate_masked_batch(batch)
+
+    # Move to device
+    market_batch = market_batch.to(self.device)
+    stock_batch = stock_batch.to(self.device)
+    targets = targets.to(self.device)
+    mask = mask.to(self.device)
+
+    # Forward pass
+    optimizer.zero_grad()
+    y_pred = self.model(market_batch, stock_batch).squeeze(-1)
+
+    # Compute loss with masking
+    loss = masked_weighted_loss(
+        y_pred, targets, mask, self.weights,
+        direction_penalty=5.0,
+        direction_multiplier=2.0
+    )
+
+    # Backward pass
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+    optimizer.step()
+
+    # Count valid predictions
+    n_valid = int(mask.sum().item())
+
+    return (
+        loss.item(),
+        n_valid,
+        y_pred.detach().cpu().numpy(),
+        targets.detach().cpu().numpy(),
+        mask.detach().cpu().numpy()
+    )
+
+
+METHOD: train_window() - PHASE A
+--------------------------------
+def train_window(
+    self,
+    window: dict,                       # {train_start, train_end, val_start, val_end, ...}
+    optimizer: torch.optim.Optimizer
+) -> dict
+
+Returns dict with training results:
+    {
+        'train_losses': List[float],
+        'val_losses': List[float],
+        'best_val_loss': float,
+        'epochs_trained': int,
+        'val_mse': float,
+        'val_mae': float,
+        'val_corr': float,
+        'val_direction_acc': float,
+        'best_preds': np.ndarray,
+        'best_targets': np.ndarray,
+        'best_model_state': dict
+    }
+
+SIMPLIFIED PSEUDOCODE:
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(self.config['epochs_per_window']):
+
+        # 1. SAMPLE ONE DATE SEQUENCE FOR ENTIRE EPOCH
+        sequence_dates, all_tickers = self.sampler.sample_epoch_dates(
+            window['train_start'], window['train_end'], rng
+        )
+        print(f"Epoch {epoch} dates: {sequence_dates[0]} to {sequence_dates[-1]}")
+
+        # 2. LOAD MARKET DATA ONCE
+        market_seq = self.market_df.loc[sequence_dates].values  # (92, 201)
+
+        # 3. SELECT INITIAL ACTIVE PARQUETS
+        active_batches, ticker_pool = self._select_active_parquets(
+            self.config['n_active_parquets'], rng
+        )
+        print(f"Parquets: {active_batches} ({len(ticker_pool)} tickers)")
+
+        epoch_losses = []
+
+        for step in range(self.config['steps_per_epoch']):
+
+            # 4. ROTATE PARQUETS EVERY N STEPS
+            if step > 0 and step % self.config['steps_per_rotation'] == 0:
+                active_batches, ticker_pool = self._select_active_parquets(
+                    self.config['n_active_parquets'], rng
+                )
+                print(f"Step {step}: Rotated to parquets {active_batches}")
+
+            # 5. SAMPLE TICKERS FROM POOL
+            tickers = self._sample_tickers_from_pool(
+                ticker_pool, self.config['batch_size'], rng
+            )
+
+            # 6. TRAIN STEP
+            loss, n_valid, preds, targets, masks = self._train_step_fixed_dates(
+                sequence_dates, market_seq, tickers, optimizer
+            )
+            epoch_losses.append(loss)
+
+            # 7. PRINT METRICS
+            if (step + 1) % self.config['show_rate'] == 0:
+                # Compute and print MSE, Corr, Dir, N
+
+        # 8. VALIDATE AT END OF EPOCH
+        val_loss, val_preds, val_targets = self._evaluate(
+            window['val_start'], window['val_end'],
+            n_steps=self.config['val_steps']
+        )
+        print(f"Epoch {epoch} VAL - Loss: {val_loss}")
+
+        # 9. EARLY STOPPING
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= self.config['patience']:
+                print("Early stopping!")
+                break
+
+    return results_dict
+
+
+METHOD: finetune_on_validation() - PHASE B
+------------------------------------------
+def finetune_on_validation(
+    self,
+    window: dict,
+    epochs: int = 10,
+    lr: float = 0.0005,
+    steps_per_epoch: int = 200
+) -> dict
+
+Returns: {'train_losses': List[float]}
+
+Same structure as train_window() but:
+- Trains on [val_start, val_end] instead of [train_start, train_end]
+- Lower learning rate (0.0005 vs 0.001)
+- No validation/early stopping
+- Fewer epochs (10 vs 100)
+
+
+METHOD: _evaluate()
+-------------------
+def _evaluate(
+    self,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    n_steps: int = 50
+) -> Tuple[float, np.ndarray, np.ndarray]
+
+Returns: (avg_loss, all_predictions, all_targets)
+
+Uses get_last_date_sequence() for deterministic evaluation (fixed anchor date).
+No gradient computation (torch.no_grad()).
+Accumulates predictions across n_steps batches of tickers.
+
+
+METHOD: evaluate_test()
+-----------------------
+def evaluate_test(
+    self,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+    n_steps: int = 50
+) -> Tuple[float, np.ndarray, np.ndarray]
+
+Simple wrapper that calls _evaluate() on test window.
+
+
+================================================================================
+8. LOSS FUNCTIONS
+================================================================================
+
+LOCATION: Cell 24 of conditional_factor_model.ipynb
+
+
+FUNCTION: create_exponential_weights()
+--------------------------------------
+def create_exponential_weights(
+    length: int,
+    decay: float = 0.95
+) -> torch.Tensor
+
+Creates exponentially increasing weights for time-decay loss.
+
+FORMULA:
+    weight[t] = decay^(length - t - 1)
+
+    Then normalized: weights = weights / weights.sum()
+
+EXAMPLE for length=5, decay=0.75:
+    Raw weights:
+        t=0: 0.75^4 = 0.316
+        t=1: 0.75^3 = 0.422
+        t=2: 0.75^2 = 0.562
+        t=3: 0.75^1 = 0.750
+        t=4: 0.75^0 = 1.000
+
+    After normalization: [0.104, 0.138, 0.184, 0.246, 0.328]
+
+    Ratio of last to first: 1.0 / 0.316 = 3.16x
+
+For length=30, decay=0.75:
+    Last prediction weighted ~1000x more than first (before normalization)
+    After normalization: ~20-30x more important
+
+
+FUNCTION: masked_weighted_loss()
+--------------------------------
+def masked_weighted_loss(
+    y_pred: torch.Tensor,              # (B, target_patches)
+    y_true: torch.Tensor,              # (B, target_patches)
+    mask: torch.Tensor,                # (B, target_patches) - 1=valid, 0=missing
+    weights: torch.Tensor,             # (target_patches,) - time decay weights
+    direction_penalty: float = 5.0,    # Fixed penalty for wrong sign
+    direction_multiplier: float = 2.0  # Multiplier on MSE for wrong sign
+) -> torch.Tensor                      # Scalar loss
+
+EXACT FORMULA:
+
+    # 1. Base MSE
+    mse = (y_pred - y_true) ** 2
+
+    # 2. Direction penalty components
+    wrong_direction = (torch.sign(y_pred) != torch.sign(y_true)).float()
+    dir_multiplier = 1.0 + direction_multiplier * wrong_direction
+    # dir_multiplier = 1.0 if same sign, 3.0 if opposite sign
+
+    dir_penalty = wrong_direction * direction_penalty
+    # dir_penalty = 0.0 if same sign, 5.0 if opposite sign
+
+    # 3. Per-timestep loss
+    per_timestep_loss = mse * dir_multiplier + dir_penalty
+    # If correct direction: loss = mse
+    # If wrong direction:   loss = mse * 3.0 + 5.0
+
+    # 4. Apply time-decay weights
+    weighted_loss = per_timestep_loss * weights.unsqueeze(0)
+    # weights broadcast: (1, target_patches) * (B, target_patches)
+
+    # 5. Apply mask (only count valid entries)
+    masked_loss = weighted_loss * mask
+
+    # 6. Normalize by sum of valid weights (not count)
+    valid_weight_sum = (mask * weights.unsqueeze(0)).sum()
+
+    if valid_weight_sum > 0:
+        loss = masked_loss.sum() / valid_weight_sum
+    else:
+        loss = torch.tensor(0.0, requires_grad=True)
+
+    return loss
+
+
+WHY THIS LOSS FUNCTION?
+-----------------------
+1. MSE: Standard regression loss for magnitude
+
+2. Direction penalty: In trading, getting the direction wrong is catastrophic.
+   A prediction of +1% when actual is -1% loses money on both long and short.
+   The 3x multiplier + 5.0 fixed penalty heavily penalizes sign errors.
+
+3. Time-decay weights: Later predictions (with more context) are more reliable
+   and closer to the actual trading decision. Weight them more heavily.
+
+4. Masking: Some stocks don't have data for all dates (IPOs, delistings).
+   Masking ensures we only compute loss on valid data points.
+
+5. Weight normalization: Dividing by valid_weight_sum (not just mask.sum())
+   ensures proper weighting even with missing data.
+
+
+================================================================================
+9. MODEL ARCHITECTURE
+================================================================================
+
+LOCATION: Cells 7-13 of conditional_factor_model.ipynb
+
+The model implements the conditional factor model:
+
+    r_hat[i,t+H] = b[i,t]^T * lambda[t] + alpha[t]
+
+Where:
+- b[i,t] = f(x[i,t]):     Stock exposures from stock features
+- lambda[t] = g(m[t]):    Factor premia from market state
+- alpha[t] = h(m[t]):     Time-varying intercept (optional)
+
+
+CLASS: LiquidPremia (Main Model)
+--------------------------------
+LOCATION: Cell 13
+
+def __init__(
+    self,
+    f_market: int,                      # Market feature dimension (201)
+    n_factors: int,                     # Number of latent factors (16)
+    d_model: int = 32,                  # Hidden dimension
+    target_patches: int = 30,           # Prediction horizon
+    n_liquid_layers: int = 1,           # Liquid encoder depth
+    d_state: int = 16,                  # SSM state dimension
+    d_conv: int = 4,                    # SSM conv dimension
+    expand: int = 2,                    # SSM expansion factor
+    patch_sizes: List = [None, 14],     # Multi-scale patch sizes
+    f_stock: int = None,                # Stock feature dimension (164)
+    stock_hidden_dim: int = None,       # Stock MLP hidden dim
+    encoder_type: str = 'liquid',       # 'liquid' or 'lstm'
+    use_alpha: bool = True              # Include intercept term
+)
+
+
+FORWARD PASS:
+
+def forward(self, market_features, stock_features=None):
+    # market_features: (B, seq_len, f_market) = (B, 92, 201)
+    # stock_features:  (B, f_stock) = (B, 164)
+
+    # 1. FACTOR PREMIA from market state
+    lambda_t = self.factor_premia_model(market_features)
+    # lambda_t: (B, target_patches, n_factors) = (B, 30, 16)
+
+    # 2. STOCK EXPOSURES from stock features
+    if self.stock_exposure_model is not None and stock_features is not None:
+        b_it = self.stock_exposure_model(stock_features)
+        # b_it: (B, n_factors) = (B, 16)
+
+        b_it = b_it.unsqueeze(1)
+        # b_it: (B, 1, n_factors) - broadcast across time
+
+        # 3. DOT PRODUCT: exposures * premia
+        y_pred = (lambda_t * b_it).sum(dim=-1, keepdim=True)
+        # Element-wise: (B, 30, 16) * (B, 1, 16) -> (B, 30, 16)
+        # Sum over factors: (B, 30, 16) -> (B, 30, 1)
+    else:
+        y_pred = lambda_t.sum(dim=-1, keepdim=True)
+
+    # 4. TIME-VARYING INTERCEPT (optional)
+    if self.use_alpha:
+        alpha_t = self.alpha_head(lambda_t)  # (B, 30, 1)
+        y_pred = y_pred + alpha_t
+
+    return y_pred  # (B, 30, 1)
+
+
+CLASS: MultiScaleLiquid (Factor Premia Encoder)
+-----------------------------------------------
+LOCATION: Cell 11
+
+Encodes market state m[t] to produce time-varying factor premia lambda[t].
+
+ARCHITECTURE:
+1. IndicatorMixing: (B, T, f_raw) -> (B, T, d_model)
+   - Per-timestep MLP that mixes market indicators
+   - 2-layer MLP with GELU, Dropout(0.3), LayerNorm
+
+2. Multi-Scale Patch Processing:
+   - Scale 1 (None): No patching, use last target_patches directly
+   - Scale 2 (14): Rolling 14-day patches with stride=1
+
+   Each scale uses OverlappingPatchEmbedding:
+   - Conv1d with kernel_size=patch_size, stride=1
+   - Output: (B, target_patches, d_model)
+
+3. Liquid/LSTM Encoders (per scale):
+   - CustomLiquid: Selective state-space model
+   - Or LSTMEncoder: LSTM + projection
+   - Output: (B, target_patches, d_model)
+
+4. FactorPremiaHead:
+   - Concatenate all scales: (B, target_patches, num_scales * d_model)
+   - 2-layer MLP: -> (B, target_patches, n_factors)
+
+
+CLASS: StockExposureModel
+-------------------------
+LOCATION: Cell 12
+
+Simple 3-layer MLP for stock features -> factor exposures.
+
+def __init__(self, f_stock, n_factors, hidden_dim=None):
+    if hidden_dim is None:
+        hidden_dim = 2 * n_factors
+
+    self.mlp = nn.Sequential(
+        nn.Linear(f_stock, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(0.3),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.GELU(),
+        nn.Dropout(0.3),
+        nn.Linear(hidden_dim, n_factors)
+    )
+
+Input: (B, f_stock) = (B, 164)
+Output: (B, n_factors) = (B, 16)
+
+Key property: NO temporal modeling. Stock exposures are "slow-moving"
+cross-sectional characteristics, not time-varying signals.
+
+
+CLASS: CustomLiquid (Selective State Space Model)
+-------------------------------------------------
+LOCATION: Cell 9
+
+Implements Liquid SSM following Equation 9 from the paper:
+    h[t+1] = [A_bar + diag(B_bar * u[t])] * h[t] + (B_bar * u[t])
+    y[t] = C @ h[t]
+
+Where:
+- A_bar: (d_state, d_state) - base transition matrix
+- B_bar: (d_state,) - diagonal modulation vector
+- C: (d_model, d_state) - output projection
+- u[t] = W_u @ x[t] - input projection
+
+The key insight: u[t] (derived from input) modulates the transition matrix,
+making the dynamics input-dependent (hence "liquid").
+
+
+================================================================================
+10. TRAINING PIPELINE FLOW
+================================================================================
+
+COMPLETE DATA FLOW DIAGRAM
+--------------------------
+
+                         INITIALIZATION
+                              |
+                              v
+            +----------------------------------------+
+            |  MetadataIndex._build_index()          |
+            |  Scans all 59 parquets                 |
+            |  -> ticker_to_meta, batch_to_tickers  |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  DateWindowSampler.__init__()          |
+            |  -> common_dates (intersection)        |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  create_rolling_windows()              |
+            |  -> List of {train, val, test} windows |
+            +----------------------------------------+
+                              |
+    ========================= | =========================
+                              |
+              FOR EACH WINDOW (walk-forward)
+                              |
+                              v
+            +----------------------------------------+
+            |         PHASE A: TRAINING              |
+            +----------------------------------------+
+                              |
+                  FOR EACH EPOCH:
+                              |
+                              v
+            +----------------------------------------+
+            |  sampler.sample_epoch_dates()          |
+            |  -> sequence_dates (92 dates)          |
+            |  -> all_tickers (valid for dates)      |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  market_df.loc[sequence_dates].values  |
+            |  -> market_seq (92, 201)               |
+            |  [Loaded ONCE per epoch]               |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  _select_active_parquets(4, rng)       |
+            |  -> active_batches [e.g., 3, 12, 28]   |
+            |  -> ticker_pool (~200 tickers)         |
+            +----------------------------------------+
+                              |
+              FOR EACH STEP (200 per epoch):
+                              |
+                              v
+            +----------------------------------------+
+            |  If step % 20 == 0:                    |
+            |    _select_active_parquets() again     |
+            |    -> new ticker_pool                  |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  _sample_tickers_from_pool()           |
+            |  -> batch_tickers (64 tickers)         |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  parquet_reader.extract_ticker_data()  |
+            |  tickers=batch_tickers                 |
+            |  dates=sequence_dates[-30:]  [OPTIM]   |
+            |  -> ticker_data: Dict[ticker, DF]      |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  ConditionalFactorDatasetV2()          |
+            |  + collate_masked_batch()              |
+            |  -> market_batch (64, 92, 201)         |
+            |  -> stock_batch (64, 164) [standardized]|
+            |  -> targets (64, 30)                   |
+            |  -> mask (64, 30)                      |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  model(market_batch, stock_batch)      |
+            |  -> y_pred (64, 30)                    |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  masked_weighted_loss()                |
+            |  -> scalar loss                        |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  loss.backward()                       |
+            |  clip_grad_norm_(1.0)                  |
+            |  optimizer.step()                      |
+            +----------------------------------------+
+                              |
+              END STEP LOOP   |
+                              |
+                              v
+            +----------------------------------------+
+            |  _evaluate(val_start, val_end)         |
+            |  -> val_loss, val_preds, val_targets   |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |  Early stopping check                  |
+            |  Save best_model_state if improved     |
+            +----------------------------------------+
+                              |
+              END EPOCH LOOP  |
+                              |
+                              v
+            +----------------------------------------+
+            |         PHASE B: FINE-TUNING           |
+            |  Load best_model_state from Phase A    |
+            |  Train on val_start to val_end         |
+            |  Lower LR (0.0005), fewer epochs (10)  |
+            +----------------------------------------+
+                              |
+                              v
+            +----------------------------------------+
+            |         TEST EVALUATION                |
+            |  evaluate_test(test_start, test_end)   |
+            |  -> test_loss, test_preds, test_targets|
+            +----------------------------------------+
+                              |
+              END WINDOW      |
+    ========================= | =========================
+                              |
+                              v
+            +----------------------------------------+
+            |  Save all predictions to CSV           |
+            |  validation_predictions.csv            |
+            |  test_predictions.csv                  |
+            +----------------------------------------+
+
+
+================================================================================
+11. KNOWN ISSUE: TICKER DATE COVERAGE
+================================================================================
+
+PROBLEM DESCRIPTION
+-------------------
+During training, you may see output like:
+
+    Parquets: [18, 33, 23, 8] (200 tickers)
+    Step 20: Rotated to parquets [9, 21, 5, 50] (150 tickers)
+    Step 40: Rotated to parquets [13, 58, 14, 40] (100 tickers)
+
+The ticker count varies because some parquets contain stocks that have NO DATA
+for the current training window dates.
+
+
+ROOT CAUSE
+----------
+Parquet files are organized chronologically by IPO date:
+
+    batch_0000 - batch_0040: Older stocks (data from 2015+)
+    batch_0041 - batch_0050: Stocks that IPO'd around 2020-2021
+    batch_0051 - batch_0058: Recent IPOs (2021-2025)
+
+When training on early dates (e.g., 2019), stocks in later batches have no data:
+
+    batch_50 example:
+    - Contains: RBLX, COIN, CPNG, DOCN, PATH, etc.
+    - These all IPO'd in 2021
+    - When training on 2019 dates: ALL 50 tickers are invalid
+
+    batch_58 example:
+    - Contains: CRWV, NMAX, SMA, etc.
+    - These IPO'd in late 2025
+    - Only 8 tickers, all invalid for any date before 2025
+
+
+VERIFICATION
+------------
+We verified this with parquets [9, 21, 5, 50] which reported 150 tickers:
+
+    Total tickers in parquets: 200
+    Tickers with data in 2019-02-05 to 2019-06-17: 150
+    Tickers WITHOUT data in range: 50
+
+    All 50 invalid tickers are from batch_50:
+    - EXE: 2021-08-30 to 2025-12-17
+    - RBLX: 2021-09-27 to 2025-12-17
+    - COIN: 2021-11-01 to 2025-12-17
+    ... (all IPO'd in 2021)
+
+
+PREVIOUS BEHAVIOR (BEFORE FIX)
+------------------------------
+The _select_active_parquets() function previously returned ALL tickers in selected
+parquets without checking date coverage. This caused:
+
+1. Invalid tickers returned empty DataFrames from extract_ticker_data()
+2. ConditionalFactorDatasetV2 created zero-filled stock features
+3. Mask was all zeros for these tickers
+4. masked_weighted_loss() ignored them (due to mask)
+
+Training still worked correctly, but:
+- Wasted I/O reading parquets with no valid data
+- Reported ticker count was misleading
+- Batch size was effectively smaller than configured
+
+
+FIX IMPLEMENTED
+---------------
+The function now accepts date_start and date_end parameters and filters tickers
+using the MetadataIndex:
+
+def _select_active_parquets(
+    self,
+    n_active: int,
+    rng: np.random.Generator,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp
+) -> Tuple[List[int], List[str]]:
+
+    active_batches = rng.choice(
+        self._n_batches,
+        size=min(n_active, self._n_batches),
+        replace=False
+    ).tolist()
+
+    ticker_pool = []
+    for batch_idx in active_batches:
+        for ticker in self._batch_to_tickers[batch_idx]:
+            meta = self.index.ticker_to_meta[ticker]
+            # Only include tickers with data covering the full date range
+            if meta.min_date <= date_start and meta.max_date >= date_end:
+                ticker_pool.append(ticker)
+
+    return active_batches, ticker_pool
+
+All call sites now pass sequence_dates[0] and sequence_dates[-1] as the date range.
+This ensures only tickers with valid data for the training window are sampled.
+
+
+================================================================================
+12. CONFIGURATION REFERENCE
+================================================================================
+
+# Model Architecture
+N_FACTORS = 16                  # Latent factor dimension
+D_MODEL = 32                    # Hidden dimension in encoders
+N_LIQUID_LAYERS = 1             # Depth of Liquid/LSTM encoders
+D_STATE = 16                    # SSM state dimension
+PATCH_SIZES = [None, 14]        # Multi-scale: [no patch, 2-week rolling]
+ENCODER_TYPE = 'liquid'         # 'liquid' or 'lstm'
+
+# Data Dimensions
+SEQ_LEN = 92                    # Market sequence length (~4 months)
+TARGET_PATCHES = 30             # Prediction horizon (30 days)
+BATCH_SIZE = 64                 # Tickers per training step
+F_STOCK = 164                   # Stock feature dimension
+F_MARKET = 201                  # Market feature dimension
+
+# Training - Phase A
+LEARNING_RATE = 0.001           # Initial learning rate
+EPOCHS_PER_WINDOW = 100         # Max epochs (early stopping)
+STEPS_PER_EPOCH = 200           # Training steps per epoch
+VAL_STEPS = 50                  # Validation steps
+PATIENCE = 20                   # Early stopping patience
+DECAY = 0.75                    # Exponential weight decay
+
+# Training - Phase B
+PHASE_B_EPOCHS = 10             # Fine-tuning epochs
+PHASE_B_LR = 0.0005             # Lower learning rate
+PHASE_B_STEPS_PER_EPOCH = 200   # Steps per epoch
+
+# Walk-Forward Validation
+TRAIN_YEARS = 1.0               # Training window (252 trading days)
+VAL_YEARS = 2/52                # Validation window (~14 days)
+
+# Parquet Optimization
+N_ACTIVE_PARQUETS = 4           # Parquets in rotation
+STEPS_PER_ROTATION = 20         # Steps before rotating
+
+# Display
+SHOW_RATE = 20                  # Print metrics every N steps
+
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
